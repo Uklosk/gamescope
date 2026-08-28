@@ -10,8 +10,10 @@
 #include <stdlib.h>
 #include <poll.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cmath>
 #include <cinttypes>
 #include <climits>
 #include <cstddef>
@@ -30,6 +32,7 @@
 
 #include "backend.h"
 #include "color_helpers.h"
+#include "Backends/DRMNvidiaColor.h"
 #include "Utils/Defer.h"
 #include "Utils/Parsers.h"
 #include "Utils/String.h"
@@ -73,6 +76,9 @@ gamescope::ConVar<bool> cv_drm_debug_disable_color_encoding( "drm_debug_disable_
 gamescope::ConVar<bool> cv_drm_debug_disable_color_range( "drm_debug_disable_color_range", false, "YUV Color Range chicken bit. (Forces COLOR_RANGE to DEFAULT, does not affect other logic)" );
 gamescope::ConVar<bool> cv_drm_debug_disable_explicit_sync( "drm_debug_disable_explicit_sync", false, "Force disable explicit sync on the DRM backend." );
 gamescope::ConVar<bool> cv_drm_debug_disable_in_fence_fd( "drm_debug_disable_in_fence_fd", false, "Force disable IN_FENCE_FD being set to avoid over-synchronization on the DRM backend." );
+
+
+gamescope::ConVar<int> cv_drm_composite_steam_surfaces( "drm_composite_steam_surfaces", -1, "Composite rather than scan out whenever a Steam-rendered surface is on screen: -1 automatic (on for nvidia-drm), 0 off, 1 on. nvidia-drm renders garbage when scanning those out directly, whether the Steam UI is the base layer or the Steam overlay is on top of a game. mangoapp and WSI-layer game swapchains are unaffected and keep scanning out." );
 
 gamescope::ConVar<bool> cv_drm_allow_dynamic_modes_for_external_display( "drm_allow_dynamic_modes_for_external_display", false, "Allow dynamic mode/refresh rate switching for external displays." );
 
@@ -328,6 +334,12 @@ namespace gamescope
 			std::optional<CDRMAtomicProperty> AMD_PLANE_LUT3D;
 			std::optional<CDRMAtomicProperty> AMD_PLANE_BLEND_TF;
 			std::optional<CDRMAtomicProperty> AMD_PLANE_BLEND_LUT;
+			std::optional<CDRMAtomicProperty> NV_INPUT_COLORSPACE;
+			std::optional<CDRMAtomicProperty> NV_PLANE_DEGAMMA_TF;
+			std::optional<CDRMAtomicProperty> NV_PLANE_DEGAMMA_LUT;
+			std::optional<CDRMAtomicProperty> NV_PLANE_DEGAMMA_LUT_SIZE; // Immutable
+			std::optional<CDRMAtomicProperty> NV_PLANE_DEGAMMA_MULTIPLIER;
+			std::optional<CDRMAtomicProperty> NV_PLANE_BLEND_CTM;
 			std::optional<CDRMAtomicProperty> DUMMY_END;
 		};
 		      PlaneProperties &GetProperties()       { return m_Props; }
@@ -359,6 +371,10 @@ namespace gamescope
 			std::optional<CDRMAtomicProperty> VRR_ENABLED;
 			std::optional<CDRMAtomicProperty> OUT_FENCE_PTR;
 			std::optional<CDRMAtomicProperty> AMD_CRTC_REGAMMA_TF;
+			std::optional<CDRMAtomicProperty> NV_CRTC_REGAMMA_TF;
+			std::optional<CDRMAtomicProperty> NV_CRTC_REGAMMA_LUT;
+			std::optional<CDRMAtomicProperty> NV_CRTC_REGAMMA_LUT_SIZE; // Immutable
+			std::optional<CDRMAtomicProperty> NV_CRTC_REGAMMA_DIVISOR;
 			std::optional<CDRMAtomicProperty> DUMMY_END;
 		};
 		      CRTCProperties &GetProperties()       { return m_Props; }
@@ -573,6 +589,10 @@ extern std::string g_reshade_effect;
 
 bool drm_update_color_mgmt(struct drm_t *drm);
 bool drm_supports_color_mgmt(struct drm_t *drm);
+bool drm_is_nvidia(struct drm_t *drm);
+bool drm_probe_plane_scaling(struct drm_t *drm, uint32_t uFbId, uint32_t uWidth, uint32_t uHeight);
+bool drm_has_nv_color_mgmt(struct drm_t *drm);
+bool drm_supports_nv_color_mgmt(struct drm_t *drm);
 bool drm_set_connector( struct drm_t *drm, gamescope::CDRMConnector *conn );
 
 struct drm_color_ctm2 {
@@ -1677,7 +1697,11 @@ gamescope::OwningRc<gamescope::IBackendFb> drm_fbid_from_dmabuf( struct drm_t *d
 		}
 	}
 
-	drm_log.debugf("make fbid %u", fb_id);
+	drm_log.debugf( "make fbid %u: %ux%u format 0x%" PRIX32 " modifier 0x%" PRIX64
+		" planes %d stride %u offset %u (%s)",
+		fb_id, dma_buf->width, dma_buf->height, dma_buf->format, dma_buf->modifier,
+		dma_buf->n_planes, dma_buf->stride[0], dma_buf->offset[0],
+		dma_buf->modifier != DRM_FORMAT_MOD_INVALID ? "AddFB2WithModifiers" : "AddFB2, no modifier" );
 
 	pBackendFb = new gamescope::CDRMFb( fb_id );
 
@@ -2121,6 +2145,13 @@ namespace gamescope
 			m_Props.AMD_PLANE_LUT3D          = CDRMAtomicProperty::Instantiate( "AMD_PLANE_LUT3D",          this, *rawProperties );
 			m_Props.AMD_PLANE_BLEND_TF       = CDRMAtomicProperty::Instantiate( "AMD_PLANE_BLEND_TF",       this, *rawProperties );
 			m_Props.AMD_PLANE_BLEND_LUT      = CDRMAtomicProperty::Instantiate( "AMD_PLANE_BLEND_LUT",      this, *rawProperties );
+
+			m_Props.NV_INPUT_COLORSPACE         = CDRMAtomicProperty::Instantiate( "NV_INPUT_COLORSPACE",         this, *rawProperties );
+			m_Props.NV_PLANE_DEGAMMA_TF         = CDRMAtomicProperty::Instantiate( "NV_PLANE_DEGAMMA_TF",         this, *rawProperties );
+			m_Props.NV_PLANE_DEGAMMA_LUT        = CDRMAtomicProperty::Instantiate( "NV_PLANE_DEGAMMA_LUT",        this, *rawProperties );
+			m_Props.NV_PLANE_DEGAMMA_LUT_SIZE   = CDRMAtomicProperty::Instantiate( "NV_PLANE_DEGAMMA_LUT_SIZE",   this, *rawProperties );
+			m_Props.NV_PLANE_DEGAMMA_MULTIPLIER = CDRMAtomicProperty::Instantiate( "NV_PLANE_DEGAMMA_MULTIPLIER", this, *rawProperties );
+			m_Props.NV_PLANE_BLEND_CTM          = CDRMAtomicProperty::Instantiate( "NV_PLANE_BLEND_CTM",          this, *rawProperties );
 		}
 	}
 
@@ -2148,6 +2179,10 @@ namespace gamescope
 			m_Props.VRR_ENABLED         = CDRMAtomicProperty::Instantiate( "VRR_ENABLED",         this, *rawProperties );
 			m_Props.OUT_FENCE_PTR       = CDRMAtomicProperty::Instantiate( "OUT_FENCE_PTR",       this, *rawProperties );
 			m_Props.AMD_CRTC_REGAMMA_TF = CDRMAtomicProperty::Instantiate( "AMD_CRTC_REGAMMA_TF", this, *rawProperties );
+			m_Props.NV_CRTC_REGAMMA_TF       = CDRMAtomicProperty::Instantiate( "NV_CRTC_REGAMMA_TF",       this, *rawProperties );
+			m_Props.NV_CRTC_REGAMMA_LUT      = CDRMAtomicProperty::Instantiate( "NV_CRTC_REGAMMA_LUT",      this, *rawProperties );
+			m_Props.NV_CRTC_REGAMMA_LUT_SIZE = CDRMAtomicProperty::Instantiate( "NV_CRTC_REGAMMA_LUT_SIZE", this, *rawProperties );
+			m_Props.NV_CRTC_REGAMMA_DIVISOR  = CDRMAtomicProperty::Instantiate( "NV_CRTC_REGAMMA_DIVISOR",  this, *rawProperties );
 		}
 	}
 
@@ -2787,6 +2822,51 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				else
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", 0 );
 			}
+
+			if ( drm_supports_nv_color_mgmt( drm ) )
+			{
+				const nv_plane_color_config_t nvConfig = nv_plane_color_config_for( entry.layerState[i].colorspace, g_bOutputHDREnabled );
+
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_INPUT_COLORSPACE", nvConfig.ulInputColorspace );
+
+				std::shared_ptr<gamescope::BackendBlob> pDegammaLut;
+				if ( nvConfig.bNeedsDegammaLut && drm->pPrimaryPlane->GetProperties().NV_PLANE_DEGAMMA_LUT_SIZE )
+					pDegammaLut = nv_get_degamma_lut_blob( uint32_t( drm->pPrimaryPlane->GetProperties().NV_PLANE_DEGAMMA_LUT_SIZE->GetCurrentValue() ) );
+
+				if ( !cv_drm_debug_disable_degamma_tf )
+				{
+					liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_TF", nvConfig.ulDegammaTF );
+					liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_LUT", pDegammaLut ? pDegammaLut->GetBlobValue() : 0 );
+				}
+				else
+				{
+					liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_TF", NV_DRM_TRANSFER_FUNCTION_DEFAULT );
+					liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_LUT", 0 );
+				}
+
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_MULTIPLIER", nv_s31_32_from_float( nvConfig.flMultiplier ) );
+
+				// Note that gamescope's per-layer ctm is a drm_color_ctm2 (3x4) built
+				// for AMD_PLANE_CTM; NV_PLANE_BLEND_CTM is a 3x3 drm_color_ctm, so it
+				// cannot be reused here. Only the primaries conversion is applied.
+				std::shared_ptr<gamescope::BackendBlob> pBlendCtm;
+				if ( !cv_drm_debug_disable_ctm && nvConfig.bNeeds2020Matrix )
+					pBlendCtm = nv_get_2020_from_709_ctm_blob();
+
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_BLEND_CTM", pBlendCtm ? pBlendCtm->GetBlobValue() : 0 );
+			}
+			else if ( drm_has_nv_color_mgmt( drm ) )
+			{
+				// Put the plane back to neutral rather than just leaving it alone.
+				// Atomic state persists, so a plane still carrying the previous frame's
+				// PQ degamma while the CRTC regamma has dropped to DEFAULT scans out
+				// linear light as though it were PQ, and the result is very dark.
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_INPUT_COLORSPACE", NV_DRM_INPUT_COLOR_SPACE_NONE );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_TF", NV_DRM_TRANSFER_FUNCTION_DEFAULT );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_LUT", 0 );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_MULTIPLIER", k_ulNvS31_32One );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_BLEND_CTM", 0 );
+			}
 		}
 		else
 		{
@@ -2805,6 +2885,15 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_LUT3D", 0 );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", 0 );
+			}
+
+			if ( drm_has_nv_color_mgmt( drm ) )
+			{
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_INPUT_COLORSPACE", NV_DRM_INPUT_COLOR_SPACE_NONE );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_TF", NV_DRM_TRANSFER_FUNCTION_DEFAULT );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_LUT", 0 );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_DEGAMMA_MULTIPLIER", k_ulNvS31_32One );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "NV_PLANE_BLEND_CTM", 0 );
 			}
 		}
 	}
@@ -3158,6 +3247,15 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 				drm->pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF->SetPendingValue( drm->req, inverse_tf( drm->pending.output_tf ), bForceInRequest );
 			else
 				drm->pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF->SetPendingValue( drm->req, AMDGPU_TRANSFER_FUNCTION_DEFAULT, bForceInRequest );
+		}
+
+		if ( drm->pCRTC->GetProperties().NV_CRTC_REGAMMA_TF )
+		{
+			// Planes are blended in linear light, so the CRTC has to re-encode.
+			// drm_supports_nv_color_mgmt() is HDR-only, hence PQ or nothing.
+			const bool bEncodePQ = !cv_drm_debug_disable_regamma_tf && drm_supports_nv_color_mgmt( drm );
+			drm->pCRTC->GetProperties().NV_CRTC_REGAMMA_TF->SetPendingValue( drm->req,
+				bEncodePQ ? NV_DRM_TRANSFER_FUNCTION_PQ : NV_DRM_TRANSFER_FUNCTION_DEFAULT, bForceInRequest );
 		}
 	}
 
@@ -3548,6 +3646,147 @@ bool drm_supports_color_mgmt(struct drm_t *drm)
 	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_CTM.has_value() && drm->pPrimaryPlane->GetProperties().AMD_PLANE_BLEND_TF.has_value();
 }
 
+bool drm_is_nvidia(struct drm_t *drm)
+{
+	// Cached: the driver behind an fd does not change, and this is consulted
+	// from the per-frame path.
+	static int s_nIsNvidia = -1;
+
+	if ( s_nIsNvidia < 0 )
+	{
+		s_nIsNvidia = 0;
+
+		if ( drm->fd >= 0 )
+		{
+			if ( drmVersion *pVersion = drmGetVersion( drm->fd ) )
+			{
+				s_nIsNvidia = pVersion->name && !strcmp( pVersion->name, "nvidia-drm" );
+				drmFreeVersion( pVersion );
+			}
+		}
+	}
+
+	return s_nIsNvidia != 0;
+}
+
+static int drm_test_plane_rect( struct drm_t *drm, gamescope::CDRMPlane *pPlane, uint32_t uFbId,
+	uint32_t uSrcW, uint32_t uSrcH, uint32_t uCrtcW, uint32_t uCrtcH )
+{
+	drmModeAtomicReq *pRequest = drmModeAtomicAlloc();
+	if ( !pRequest )
+		return -ENOMEM;
+	defer( drmModeAtomicFree( pRequest ) );
+
+	auto &props = pPlane->GetProperties();
+	const uint32_t uPlaneId = pPlane->GetObjectId();
+
+	const std::pair<std::optional<gamescope::CDRMAtomicProperty> *, uint64_t> setup[] =
+	{
+		{ &props.FB_ID,   uFbId },
+		{ &props.CRTC_ID, drm->pCRTC->GetObjectId() },
+		{ &props.SRC_X,   0 },
+		{ &props.SRC_Y,   0 },
+		{ &props.SRC_W,   uint64_t( uSrcW ) << 16 },
+		{ &props.SRC_H,   uint64_t( uSrcH ) << 16 },
+		{ &props.CRTC_X,  0 },
+		{ &props.CRTC_Y,  0 },
+		{ &props.CRTC_W,  uCrtcW },
+		{ &props.CRTC_H,  uCrtcH },
+	};
+
+	for ( const auto &[ pProp, ulValue ] : setup )
+	{
+		if ( !*pProp )
+			return -ENOENT;
+
+		if ( drmModeAtomicAddProperty( pRequest, uPlaneId, (*pProp)->GetPropertyId(), ulValue ) < 0 )
+			return -EINVAL;
+	}
+
+	return drmModeAtomicCommit( drm->fd, pRequest, DRM_MODE_ATOMIC_TEST_ONLY, nullptr );
+}
+
+/*
+ * Whether the primary plane can scale, established by asking the kernel rather
+ * than by recognising a driver.
+ *
+ * Two test commits. The first is 1:1 and only exists to prove the request we
+ * build is otherwise acceptable; the second differs from it in nothing but the
+ * destination size. Scaling is reported unsupported only when the 1:1 commit
+ * succeeds and the scaled one fails, so a driver we cannot probe -- no plane, no
+ * CRTC, no framebuffer yet, a request the kernel rejects for some unrelated
+ * reason -- is assumed to scale, and behaves exactly as it did before.
+ */
+bool drm_probe_plane_scaling( struct drm_t *drm, uint32_t uFbId, uint32_t uWidth, uint32_t uHeight )
+{
+	static int s_nSupportsScaling = -1;
+
+	if ( s_nSupportsScaling >= 0 )
+		return s_nSupportsScaling != 0;
+
+	if ( !drm->pPrimaryPlane || !drm->pCRTC || !uFbId || uWidth < 2 || uHeight < 2 )
+		return true;    // Not yet probeable. Ask again next frame.
+
+	if ( drm_test_plane_rect( drm, drm->pPrimaryPlane, uFbId, uWidth, uHeight, uWidth, uHeight ) != 0 )
+	{
+		// Our own request is not acceptable unscaled, so a scaled failure would
+		// prove nothing. Do not cache this: a later frame may probe cleanly.
+		drm_log.debugf( "plane scaling probe: 1:1 test commit failed, assuming scaling works" );
+		return true;
+	}
+
+	const int nScaledResult = drm_test_plane_rect( drm, drm->pPrimaryPlane, uFbId,
+		uWidth, uHeight, uWidth / 2, uHeight / 2 );
+
+	s_nSupportsScaling = ( nScaledResult == 0 );
+
+	drm_log.infof( "plane scaling %s (scaled test commit returned %d)",
+		s_nSupportsScaling ? "supported" : "NOT supported, scaled layers will be composited",
+		nScaledResult );
+
+	return s_nSupportsScaling != 0;
+}
+
+bool drm_has_nv_color_mgmt(struct drm_t *drm)
+{
+	if ( !drm->pPrimaryPlane )
+		return false;
+
+	// Gate on the subset that every plane carries. The overlay planes expose
+	// strictly fewer colour properties than the primary (no NV_PLANE_TMO_LUT, no
+	// LMS matrices), and liftoff can put any layer on any plane, so we only ever
+	// program properties that both kinds have.
+	const auto &planeProps = drm->pPrimaryPlane->GetProperties();
+	if ( !planeProps.NV_INPUT_COLORSPACE ||
+		 !planeProps.NV_PLANE_DEGAMMA_TF ||
+		 !planeProps.NV_PLANE_DEGAMMA_LUT ||
+		 !planeProps.NV_PLANE_DEGAMMA_MULTIPLIER ||
+		 !planeProps.NV_PLANE_BLEND_CTM )
+		return false;
+
+	// Without the CRTC re-encode we would be scanning out linear light.
+	if ( !drm->pCRTC || !drm->pCRTC->GetProperties().NV_CRTC_REGAMMA_TF )
+		return false;
+
+	return true;
+}
+
+bool drm_supports_nv_color_mgmt(struct drm_t *drm)
+{
+	if ( g_bForceDisableColorMgmt || cv_drm_debug_disable_nv_color_mgmt )
+		return false;
+
+	// Only claimed for an HDR output. NV_CRTC_REGAMMA_TF can encode PQ but has no
+	// gamma or sRGB entry, so an SDR output would need NV_CRTC_REGAMMA_LUT filled
+	// in before we could blend in linear and re-encode correctly. Nothing forces
+	// composition for multiple layers on an SDR output today, so there is nothing
+	// to gain by taking that risk here.
+	if ( !g_bOutputHDREnabled )
+		return false;
+
+	return drm_has_nv_color_mgmt( drm );
+}
+
 std::span<const uint32_t> drm_get_valid_refresh_rates( struct drm_t *drm )
 {
 	if ( drm && drm->pConnector )
@@ -3645,6 +3884,23 @@ namespace gamescope
 				}
 			}
 
+			// Establish whether planes can scale, now that there is a framebuffer to
+			// test against. Costs two test commits, once, the first time it can run.
+			if ( pFrameInfo->layers.count() > 0 )
+			{
+				const FrameInfo_t::Layer_t &probeLayer = pFrameInfo->layers.get( 0 );
+				gamescope::CDRMFb *pProbeFb = static_cast<gamescope::CDRMFb *>(
+					( probeLayer.tex && probeLayer.tex->GetBackendFb() )
+						? probeLayer.tex->GetBackendFb()->EnsureImported()
+						: nullptr );
+
+				if ( pProbeFb )
+				{
+					m_bSupportsPlaneScaling = drm_probe_plane_scaling( &g_DRM, pProbeFb->GetFbId(),
+						probeLayer.tex->width(), probeLayer.tex->height() );
+				}
+			}
+
 			bool bLayer0ScreenSize = close_enough(pFrameInfo->layers.get( 0 ).scale.x, 1.0f) && close_enough(pFrameInfo->layers.get( 0 ).scale.y, 1.0f);
 
 			bool bNeedsCompositeFromFilter = (g_upscaleFilter == GamescopeUpscaleFilter::NEAREST || g_upscaleFilter == GamescopeUpscaleFilter::PIXEL) && !bLayer0ScreenSize;
@@ -3675,6 +3931,28 @@ namespace gamescope
 
 			bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
 			bNeedsFullComposite |= g_uOutputRotation != 0; // can't rotate planes at scanout
+
+			// A buffer only scans out correctly on nvidia-drm if whoever allocated it
+			// knew it would be displayed. Clients using the gamescope WSI layer do;
+			// arbitrary X11 clients do not, and their buffers arrive shredded even when
+			// forced contiguous and aligned identically to buffers that work.
+			// Compositing is the only way to get those on screen.
+			const bool bCompositeSteamSurfaces = cv_drm_composite_steam_surfaces >= 0
+				? cv_drm_composite_steam_surfaces != 0
+				: drm_is_nvidia( &g_DRM );
+
+			if ( bCompositeSteamSurfaces )
+			{
+				// The Steam UI as the base layer: no WSI feedback means the buffer did
+				// not come from a client that allocated it for display.
+				bNeedsFullComposite |= steamcompmgr_get_base_layer_swapchain_feedback() == nullptr;
+
+				// The Steam overlay on top of a game is the same kind of surface, and
+				// the base layer being a game says nothing about it. mangoapp sits at
+				// g_zposExternalOverlay and scans out fine, so only this one matters.
+				for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
+					bNeedsFullComposite |= pFrameInfo->layers.get( i ).zpos == int( g_zposOverlay );
+			}
 
 			bool bDoComposite = true;
 			if ( !bNeedsFullComposite && !bWantsPartialComposite )
@@ -3986,6 +4264,11 @@ namespace gamescope
 			return nullptr;
 		}
 
+		virtual bool SupportsPlaneScaling() const override
+		{
+			return m_bSupportsPlaneScaling;
+		}
+
 		virtual bool SupportsPlaneHardwareCursor() const override
 		{
 			return true;
@@ -4065,6 +4348,9 @@ namespace gamescope
 		}
 
 	private:
+		// Answered by an atomic test commit once a framebuffer exists to test with;
+		// true until then, so nothing changes for a driver we have not probed.
+		bool m_bSupportsPlaneScaling = true;
 		bool m_bWasCompositing = false;
 		bool m_bWasPartialCompositing = false;
 		int m_nLastSingleOverlayZPos = 0;
@@ -4074,7 +4360,11 @@ namespace gamescope
 
 		bool SupportsColorManagement() const
 		{
-			return drm_supports_color_mgmt( &g_DRM );
+			// Either the AMD_PLANE_* LUT pipeline or nvidia-drm's NV_* pipeline is
+			// enough to keep several layers on planes for an HDR output. This only
+			// gates that decision in Present(); it does not choose which one gets
+			// programmed, drm_prepare_liftoff() does that.
+			return drm_supports_color_mgmt( &g_DRM ) || drm_supports_nv_color_mgmt( &g_DRM );
 		}
 
 		int Commit( const FrameInfo_t *pFrameInfo )

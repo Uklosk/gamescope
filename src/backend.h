@@ -360,6 +360,11 @@ namespace gamescope
         virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) = 0;
 
         virtual bool SupportsPlaneHardwareCursor() const = 0;
+
+        // Whether a layer whose source and destination rectangles differ can be
+        // put on a plane. nvidia-drm rejects those outright, which changes
+        // whether it is worth submitting a scaled layer at all.
+        virtual bool SupportsPlaneScaling() const { return true; }
         virtual bool SupportsTearing() const = 0;
 
         virtual bool UsesVulkanSwapchain() const = 0;

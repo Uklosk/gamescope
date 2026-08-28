@@ -2551,6 +2551,7 @@ static void ForwardVROverlayTargets()
 gamescope::ConVar<bool> cv_paint_primary_plane{ "paint_primary_plane", true };
 gamescope::ConVar<bool> cv_paint_override_redirect_plane{ "paint_override_redirect_plane", true };
 gamescope::ConVar<bool> cv_paint_steam_overlay_plane{ "paint_steam_overlay_plane", true };
+gamescope::ConVar<int> cv_paint_steam_overlay_placeholder{ "paint_steam_overlay_placeholder", -1, "Keep a transparent placeholder layer on the Steam overlay plane while the overlay is hidden, so toggling it on does not change the plane allocation: -1 automatic (off where planes cannot scale), 0 off, 1 on. The placeholder is capped at 1080p to match Steam's overlay, so above that it is a scaled layer, and a driver that cannot scale planes will composite the whole frame rather than place it." };
 gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay_plane", true };
 gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
 gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
@@ -2779,7 +2780,10 @@ paint_all( global_focus_t *pFocus, bool async )
 			if ( overlay == pFocus->inputFocusWindow && pFocus == GetCurrentFocus() )
 				update_touch_scaling( &frameInfo );
 		}
-		else if ( !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() )
+		else if ( ( cv_paint_steam_overlay_placeholder >= 0
+					? cv_paint_steam_overlay_placeholder != 0
+					: GetBackend()->SupportsPlaneScaling() )
+				&& !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() )
 		{
 			auto tex = vulkan_get_hacky_blank_texture();
 			if ( tex != nullptr && frameInfo.layers.count() < k_nMaxLayers )
